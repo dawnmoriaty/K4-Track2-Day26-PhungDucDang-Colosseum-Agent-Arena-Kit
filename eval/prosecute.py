@@ -624,7 +624,8 @@ def _hook_fabricated_citation(trace, answer, card) -> list[tuple[list[str], str]
     if ans_seq is None:
         return []
     for a in cited or []:
-        if isinstance(a, str) and a not in returned_anchors:
+        base_a = a.split("#")[0] if isinstance(a, str) else a
+        if isinstance(a, str) and a not in returned_anchors and base_a not in returned_anchors:
             return [([evt_ref(ans_seq)], f"cited anchor {a!r} was never returned by any tool_result this exchange")]
     return []
 
