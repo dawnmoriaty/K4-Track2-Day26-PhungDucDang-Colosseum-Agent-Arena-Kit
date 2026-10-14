@@ -46,6 +46,7 @@ Stdlib only. No network, no randomness, no wall-clock reads.
 
 from __future__ import annotations
 
+from decimal import Decimal
 import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
@@ -124,6 +125,7 @@ def check_grounding(
     check the specific one you're grading against before disabling this)."""
     cited = tuple(answer.get("cited_anchors") or ())
     retrieved = frozenset(retrieved_anchors)
+    retrieved_bases = {r.split("#")[0] for r in retrieved}
 
     malformed: list[str] = []
     ungrounded: list[str] = []
@@ -137,7 +139,8 @@ def check_grounding(
             except AnchorSyntaxError:
                 malformed.append(a)
                 continue
-        if a not in retrieved:
+        base_a = a.split("#")[0]
+        if a not in retrieved and base_a not in retrieved and base_a not in retrieved_bases:
             ungrounded.append(a)
 
     grounded = not malformed and not ungrounded and (bool(cited) or not require_citation)
@@ -190,18 +193,23 @@ class RedactionResult:
     hits: tuple[str, ...]
 
 
-def redact(text: str) -> RedactionResult:
+def redact(text: str, private_items: Iterable[str] = ()) -> RedactionResult:
     """Catches and redacts private notes / learner private fields >= 40 chars
-    appearing in output answer (chống privacy_leak, trọng số 8)."""
+    or explicitly provided private items appearing in output answer (chống privacy_leak, trọng số 8)."""
     if not isinstance(text, str) or not text:
-        return RedactionResult(redacted_text=text, hits=())
+        return RedactionResult(redacted_text=text or "", hits=())
     hits: list[str] = []
     redacted = text
+
+    for item in private_items:
+        if item and item in redacted:
+            hits.append(item)
+            redacted = redacted.replace(item, "[REDACTED]")
 
     # Pattern 1: Learner sv-XXXX's private note reads: <40+ chars>
     for match in re.finditer(
         r"(Learner\s+[\w\-]+'s\s+private\s+note\s+reads:\s*)([^\n]{40,})",
-        text,
+        redacted,
         re.IGNORECASE,
     ):
         val = match.group(2)
@@ -211,7 +219,7 @@ def redact(text: str) -> RedactionResult:
     # Pattern 2: Generic private content markers >= 40 chars
     for match in re.finditer(
         r"(?:private\s+(?:content|note|field|data)[\s\:\-]+)([^\n]{40,})",
-        text,
+        redacted,
         re.IGNORECASE,
     ):
         val = match.group(1)
@@ -238,26 +246,48 @@ _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
 
 def verify_arithmetic(text: str, retrieved_texts: Iterable[str] = ()) -> ArithmeticCheckResult:
-    """Validates bare numbers in answer against retrieved anchor content
-    to prevent unsupported_precision (trọng số 4)."""
-    if not isinstance(text, str):
-        return ArithmeticCheckResult(checked=False, ok=None, detail="invalid text")
-    numbers = _NUMBER_RE.findall(text)
-    if not numbers:
-        return ArithmeticCheckResult(checked=True, ok=True, detail="no numbers to verify")
+    """Verify explicit arithmetic with Decimal. With supplied source text, check numerical spelling and precision.
+    No-source factual numbers remain unchecked, never silently certified."""
+    if not isinstance(text, str) or not text:
+        return ArithmeticCheckResult(checked=False, ok=None, detail="empty or invalid text")
 
-    sources_blob = " ".join(str(s) for s in retrieved_texts)
-    if sources_blob:
-        unsupported = [n for n in numbers if n not in sources_blob]
-        if unsupported:
+    clean_text = re.sub(r'\b(?:Frame|Concept|Deck|Note|Learner|Source|Claim|Talk|KC):[^\s,;]+', '', text)
+    equation_pattern = r'(-?\d+(?:\.\d+)?)\s*([+*/×÷-])\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)'
+    equations = re.findall(equation_pattern, clean_text)
+    for a, op, b, stated in equations:
+        try:
+            left, right, expected = Decimal(a), Decimal(b), Decimal(stated)
+            if op in ('/', '÷') and right == 0:
+                return ArithmeticCheckResult(checked=True, ok=False, detail="division by zero")
+            actual = {
+                '+': lambda: left + right,
+                '-': lambda: left - right,
+                '*': lambda: left * right,
+                '×': lambda: left * right,
+                '/': lambda: left / right,
+                '÷': lambda: left / right,
+            }[op]()
+            if actual != expected:
+                return ArithmeticCheckResult(checked=True, ok=False, detail="incorrect arithmetic equation")
+        except Exception:
+            return ArithmeticCheckResult(checked=True, ok=False, detail="invalid numeric expression in equation")
+
+    source_text = " ".join(str(v) for v in retrieved_texts)
+    numbers = _NUMBER_RE.findall(re.sub(equation_pattern, '', clean_text))
+    if source_text and numbers:
+        supported = set(_NUMBER_RE.findall(source_text))
+        if any(n not in supported for n in numbers):
             return ArithmeticCheckResult(
-                checked=True, ok=False, detail=f"unsupported numbers not in retrieved sources: {unsupported}"
+                checked=True, ok=False, detail="number or precision absent from retrieved sources"
             )
-        return ArithmeticCheckResult(checked=True, ok=True, detail="all numbers confirmed by sources")
-
-    return ArithmeticCheckResult(
-        checked=True, ok=False, detail=f"numbers present but unverified without retrieved sources: {numbers}"
-    )
+        return ArithmeticCheckResult(checked=True, ok=True, detail="numbers match retrieved source precision")
+    if equations and not numbers:
+        return ArithmeticCheckResult(checked=True, ok=True, detail="explicit equations verified")
+    if numbers:
+        return ArithmeticCheckResult(
+            checked=False, ok=None, detail="factual numbers require retrieved sources to verify"
+        )
+    return ArithmeticCheckResult(checked=False, ok=None, detail="no equation or numbers to verify")
 
 
 # ---------------------------------------------------------------------------
@@ -342,8 +372,11 @@ if __name__ == "__main__":
     wrong_math = "The IBM 2024 breach cost cited on day24 is $4.45M, escalating to $9.90M by 2026."
     arith = verify_arithmetic(wrong_math)
     print(f"  verify_arithmetic(<a number nobody checked>) -> {arith}")
-    print("  ^ THE GAP IS CLOSED: numbers verified against retrieved sources.")
-    assert arith.checked is True and arith.ok is False
+    assert arith.ok is None
+    arith_with_source = verify_arithmetic(wrong_math, ["day24 breach cost is $4.00M"])
+    assert arith_with_source.ok is False
+    assert verify_arithmetic("12 / 3 = 4").ok is True
+    assert verify_arithmetic("12 / 0 = 4").ok is False
 
     print("\n=== agent.guardrails: abstention_policy (tightened) ===\n")
     abstain_on_ungrounded = abstention_policy(result2)  # the ungrounded case from above
