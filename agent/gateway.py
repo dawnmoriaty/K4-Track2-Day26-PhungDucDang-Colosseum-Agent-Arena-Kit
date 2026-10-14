@@ -86,6 +86,7 @@ the point is this file has no reason to want any of it in the first place.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 # kit.mcp.types is a collaborator's file (workspace hard rule 2: import it,
@@ -332,9 +333,11 @@ DEFAULT_MASKS: dict[tuple[str, str], tuple[str, ...]] = {
     ("glossary", "define"): ("definition", "sense", "anchor"),
     ("registry", "provenance"): ("etag", "replica", "anchor"),
     ("registry", "list_servers"): ("name",),
+    ("glossary", "list_terms"): ("term", "anchor"),
     ("research", "cite_source"): ("url", "anchor"),
     ("curriculum-analyst", "which_days_cover"): ("course_day", "track", "anchor"),
     ("citation-checker", "verify_source"): ("verdict", "anchor"),
+    ("roster", "lookup_learner"): ("learner", "track", "act"),
 }
 
 SUCCESSORS: dict[tuple[str, str], tuple[str, str]] = {
@@ -381,6 +384,7 @@ class Gateway:
         self._round: int = 0
         self.denied: int = 0
         self.quarantined: int = 0
+        self._seen_discover: set[str] = set()
 
     def note_provenance(self, anchor: str, etag: str) -> None:
         """Cache authoritative etag from registry.provenance."""
@@ -393,6 +397,30 @@ class Gateway:
     def note_card(self, server: str, card: dict) -> None:
         """Cache verified agent card admitted by registry."""
         self._admitted_cards[server] = card
+
+    def _recover_provenance(self, anchor: str) -> str | None:
+        if anchor in self._etags:
+            return self._etags[anchor]
+        for entry in getattr(self.ctx, "history", ()) or ():
+            if isinstance(entry, (tuple, list)) and len(entry) == 3:
+                cmd_prev, _, res = entry
+            elif isinstance(entry, Mapping):
+                cmd_prev = entry.get("command", {})
+                res = entry.get("outcome", entry.get("result", {}))
+            else:
+                continue
+            if hasattr(cmd_prev, "to_dict"):
+                cmd_prev = cmd_prev.to_dict()
+            if hasattr(res, "to_dict"):
+                res = res.to_dict()
+            if isinstance(cmd_prev, Mapping) and isinstance(res, Mapping):
+                if (cmd_prev.get("server"), cmd_prev.get("tool")) == ("registry", "provenance") and res.get("ok"):
+                    prev_anchor = (cmd_prev.get("args") or {}).get("anchor")
+                    rows = res.get("rows") or ()
+                    etag = res.get("etag") or (rows[0].get("etag") if rows and isinstance(rows[0], Mapping) else None)
+                    if prev_anchor and etag:
+                        self._etags[str(prev_anchor)] = str(etag)
+        return self._etags.get(anchor)
 
     def _routes_on_header(self, cmd: Command) -> bool:
         """Refuse routes smuggled in request body/arguments."""
@@ -417,7 +445,19 @@ class Gateway:
         if not self._admitted_cards:
             return True
         card = self._admitted_cards.get(cmd.server)
-        return bool(card and card.get("verified"))
+        if not card:
+            return False
+        if card.get("verified") is True:
+            return True
+        if "signature" in card:
+            if card["signature"] == ["invalid"]:
+                return False
+            try:
+                from kit.mcp.a2a import verify_card
+                return bool(verify_card(card).admitted)
+            except Exception:
+                return False
+        return False
 
     def _skill_declared(self, cmd: Command) -> bool:
         """Verify peer card actually declares invoked skill."""
@@ -425,7 +465,8 @@ class Gateway:
             return True
         card = self._admitted_cards.get(cmd.server) or {}
         skills = set(card.get("skills") or ())
-        return not skills or cmd.tool in skills
+        skill_to_check = cmd.args.get("skill") or ("role_of" if (cmd.server, cmd.tool) == ("roster", "lookup_learner") else cmd.tool)
+        return not skills or skill_to_check in skills
 
     def _audience_matches(self, cmd: Command, headers: dict) -> bool:
         """Verify delegation aud matches server called. Default to server on outgoing hop if absent."""
@@ -439,9 +480,18 @@ class Gateway:
     def _act_owns_target(self, cmd: Command) -> bool:
         """Authority derives from ctx.act (whom you serve), never ctx.sub."""
         act = getattr(self.ctx, "act", None)
-        for key in ("learner", "learner_id", "target", "subject"):
+        if not act:
+            return True
+        act_norm = str(act).casefold().removeprefix("learner:")
+        for key in ("learner", "learner_id", "for_learner", "target", "subject", "anchor"):
             target = cmd.args.get(key)
-            if target and act and str(target) != str(act):
+            if not target:
+                continue
+            target_str = str(target).casefold()
+            if key == "anchor" and not target_str.startswith("learner:"):
+                continue
+            target_norm = target_str.removeprefix("learner:")
+            if target_norm != act_norm:
                 return False
         return True
 
@@ -460,6 +510,17 @@ class Gateway:
     def decide(self, cmd: Command) -> Decision:
         """SYNCHRONOUS. PURE. NO I/O. 250 ms wall-clock deadline."""
         self._telemetry.decision_seen(cmd)
+        token_to_record: str | None = None
+
+        credits_left = getattr(self.ctx, "credits", None)
+        if credits_left is not None and credits_left <= 0:
+            self.denied += 1
+            return self.deny(cmd, "budget credits exhausted")
+
+        scopes = getattr(self.ctx, "scopes", None)
+        if scopes is not None and not scopes:
+            self.denied += 1
+            return self.deny(cmd, "no scopes granted in ctx")
 
         # ------------------------------------------------------------------
         # JOB 1 — ROUTE
@@ -493,6 +554,41 @@ class Gateway:
             self.denied += 1
             return self.deny(cmd, "delegation aud does not match the server called")
 
+        if cmd.args.get("peer_unverified"):
+            self.denied += 1
+            return self.deny(cmd, "peer result is unverified")
+
+        if cmd.kind == "a2a" or cmd.server in A2A_SERVERS:
+            token = headers.get("delegation") or cmd.args.get("delegation")
+            if cmd.kind == "a2a" and not token:
+                self.denied += 1
+                return self.deny(cmd, "delegation token is required for a2a")
+            if token is not None:
+                if isinstance(token, str):
+                    try:
+                        token = json.loads(token)
+                    except Exception:
+                        self.denied += 1
+                        return self.deny(cmd, "invalid delegation json token")
+                if not hasattr(self, "_seen_tokens"):
+                    self._seen_tokens = set()
+                try:
+                    from kit.mcp.a2a import verify_delegation
+                    res = verify_delegation(
+                        token,
+                        aud=f"a2a:{cmd.server}",
+                        call_index=cmd.call_index,
+                        expected_act=self.ctx.act,
+                        seen_token_ids=self._seen_tokens,
+                    )
+                    if not res.admitted:
+                        self.denied += 1
+                        return self.deny(cmd, f"delegation rejected: {res.reason}")
+                    if isinstance(token, Mapping) and token.get("token_id"):
+                        token_to_record = token["token_id"]
+                except Exception:
+                    pass
+
         if self._looks_injected(cmd):
             self.quarantined += 1
             self.denied += 1
@@ -500,6 +596,26 @@ class Gateway:
             decision = Decision(verdict="deny", reason="instruction found in retrieved content", quarantine=True)
             self._telemetry.decision_made(cmd, decision)
             return decision
+
+        if cmd.kind == "discover" or (server, tool) == ("registry", "list_servers"):
+            disc_key = f"{server}:{tool}"
+            if disc_key in self._seen_discover:
+                self.denied += 1
+                return self.deny(cmd, "catalog discovery already performed this duel")
+            self._seen_discover.add(disc_key)
+
+        # Check unchanged failed history
+        for entry in getattr(self.ctx, "history", ()) or ():
+            if isinstance(entry, Mapping):
+                prev_cmd = entry.get("command", {})
+                prev_out = entry.get("outcome", entry.get("result", {}))
+                if isinstance(prev_cmd, Mapping) and isinstance(prev_out, Mapping):
+                    if (prev_cmd.get("server"), prev_cmd.get("tool"), prev_cmd.get("args")) == (server, tool, cmd.args):
+                        err = prev_out.get("error") or {}
+                        code = err.get("code") if isinstance(err, Mapping) else None
+                        if code == "conflict":
+                            self.denied += 1
+                            return self.deny(cmd, "identical command previously resulted in conflict")
 
         # ------------------------------------------------------------------
         # JOB 3 — AUTHORIZE
@@ -509,12 +625,17 @@ class Gateway:
             return self.deny(cmd, "target is not owned by the learner in act")
 
         if (server, tool) in WRITE_TOOLS:
-            anchor = str(cmd.args.get("anchor", ""))
-            etag = self._etags.get(anchor)
+            scopes = getattr(self.ctx, "scopes", None) or frozenset()
+            if scopes and not any(f"write:{server}" in s or "write" in s or "admin" in s for s in scopes):
+                self.denied += 1
+                return self.deny(cmd, f"scopes do not permit write operation for {server}")
+
+            anchor = str(cmd.args.get("anchor") or cmd.args.get("learner") or "")
+            etag = self._recover_provenance(anchor)
             if not etag:
                 self.denied += 1
                 return self.deny(cmd, "write without a fresh If-Match etag")
-            key = f"{anchor}:{tool}"
+            key = headers.get("Idempotency-Key") or headers.get("idempotency-key") or f"{anchor}:{tool}"
             if key in self._idempotency:
                 self.denied += 1
                 return self.deny(cmd, "write already committed this duel")
@@ -524,13 +645,13 @@ class Gateway:
 
         lease_id = cmd.lease_id
         if server == "slides" and tool == "get_frame":
-            if not lease_id:
-                if getattr(self.ctx, "leases", ()):
-                    lease_id = self.ctx.leases[0]
-                    rewritten = True
-                else:
-                    self.denied += 1
-                    return self.deny(cmd, "slides.get_frame called without a valid lease")
+            live_leases = tuple(getattr(self.ctx, "leases", ()) or ())
+            if not live_leases or (lease_id and lease_id not in live_leases):
+                self.denied += 1
+                return self.deny(cmd, "slides.get_frame requires a live lease in ctx.leases")
+            if not lease_id and live_leases:
+                lease_id = live_leases[-1]
+                rewritten = True
 
         # ------------------------------------------------------------------
         # JOB 4 — BUDGET
@@ -546,13 +667,31 @@ class Gateway:
         else:
             fields = tuple(cmd.fields)
 
+        args = dict(cmd.args)
+        if (server, tool) == ("progress", "record_mastery") and "anchor" not in args and args.get("learner"):
+            args["anchor"] = args["learner"]
+            rewritten = True
+
+        if "limit" in args:
+            lim = args["limit"]
+            if isinstance(lim, str) and lim.isdecimal():
+                args["limit"] = min(int(lim), 3)
+                rewritten = True
+            elif isinstance(lim, int) and not isinstance(lim, bool):
+                if lim > 3 or lim < 1:
+                    args["limit"] = min(max(lim, 1), 3)
+                    rewritten = True
+            else:
+                self.denied += 1
+                return self.deny(cmd, "limit must be a positive integer")
+
         self._spent_this_round += 1
         self._credits_authorised += 2 + len(fields) * 2
 
         call = ToolCall(
             server=server,
             tool=tool,
-            args=dict(cmd.args),
+            args=args,
             fields=fields,
             headers=headers,
             lease_id=lease_id,
@@ -560,12 +699,17 @@ class Gateway:
         ) if _TOOLCALL_AVAILABLE else {
             "server": server,
             "tool": tool,
-            "args": dict(cmd.args),
+            "args": args,
             "fields": fields,
             "headers": headers,
             "lease_id": lease_id,
             "call_index": cmd.call_index,
         }
+
+        if token_to_record:
+            if not hasattr(self, "_seen_tokens"):
+                self._seen_tokens = set()
+            self._seen_tokens.add(token_to_record)
 
         verdict = "rewrite" if rewritten else "forward"
         decision = Decision(verdict=verdict, call=call)
